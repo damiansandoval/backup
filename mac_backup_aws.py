@@ -7,8 +7,111 @@ Designed to run on macOS by Service Desk technicians via MDM deployment.
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Dependency bootstrap
+#
+# Problem: when the script runs under sudo (Jamf / MDM context) pip fails
+# because macOS protects system-wide site-packages (SIP + PEP 668 on 3.12+).
+#
+# Solution: install to a self-contained deps/ folder next to the script using
+# pip --target. No system paths are touched, no privilege conflicts.
+#
+# Layout after first run:
+#   /path/to/mac_backup.py
+#   /path/to/deps/          ← rich, boto3 and their sub-deps land here
+# ---------------------------------------------------------------------------
+
 import os
 import sys
+import importlib
+import subprocess
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+DEPS_DIR   = SCRIPT_DIR / "deps"
+
+# If the script directory is not writable (e.g. SIP-protected path), fall
+# back to a location root can always write to.
+if not os.access(SCRIPT_DIR, os.W_OK):
+    DEPS_DIR = Path("/private/tmp/mac_backup_deps")
+
+# Make local deps importable before any third-party import is attempted.
+# insert(0) so our bundled copies take priority over system-wide packages.
+if DEPS_DIR.exists() and str(DEPS_DIR) not in sys.path:
+    sys.path.insert(0, str(DEPS_DIR))
+
+# Package name → pip install spec
+_REQUIRED = {
+    "rich":  "rich>=13.0",
+    "boto3": "boto3",
+}
+
+
+def _pip_install(specs: list) -> bool:
+    """Install *specs* into DEPS_DIR with pip --target (no elevated perms needed)."""
+    DEPS_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "--quiet",
+        "--target", str(DEPS_DIR),
+        "--upgrade",   # ensures a partial/corrupt install gets overwritten
+    ] + specs
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
+def bootstrap_dependencies() -> None:
+    """Ensure rich and boto3 are importable. Install into deps/ if missing."""
+    missing_specs = []
+    missing_names = []
+
+    for pkg, spec in _REQUIRED.items():
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            missing_specs.append(spec)
+            missing_names.append(pkg)
+
+    if not missing_specs:
+        return
+
+    names = " and ".join(f'"{n}"' for n in missing_names)
+    print(f"\n  Missing dependencies: {names}")
+    print(f"  Install location    : {DEPS_DIR}\n")
+    answer = input("  Install now? [Y/n] ").strip().lower()
+
+    if answer not in ("", "y", "yes"):
+        print("\n  Cannot continue without dependencies. Exiting.")
+        sys.exit(0)
+
+    print(f"  Installing {', '.join(missing_names)} …")
+
+    if not _pip_install(missing_specs):
+        print("\n  [ERROR] pip install failed.")
+        print(f"  Try manually:\n  pip install --target {DEPS_DIR} {' '.join(missing_specs)}")
+        sys.exit(1)
+
+    # Ensure the new packages are on sys.path for this process
+    if str(DEPS_DIR) not in sys.path:
+        sys.path.insert(0, str(DEPS_DIR))
+
+    # Verify each import works
+    for pkg in missing_names:
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            print(f"\n  [ERROR] Could not import '{pkg}' after install. Try rerunning.")
+            sys.exit(1)
+
+    print("  Dependencies installed.\n")
+
+
+bootstrap_dependencies()
+
+# ---------------------------------------------------------------------------
+# Third-party imports (safe after bootstrap)
+# ---------------------------------------------------------------------------
+
 import math
 import time
 import shutil
@@ -16,99 +119,10 @@ import hashlib
 import getpass
 import logging
 import platform
-import subprocess
 import threading
 import tempfile
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
-
-# ---------------------------------------------------------------------------
-# Dependency check — must happen before any third-party import
-# ---------------------------------------------------------------------------
-
-REQUIRED_PACKAGES = {"rich": "rich", "boto3": "boto3"}
-HOMEBREW_INSTALL_URL = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
-
-
-def _brew_path() -> Optional[str]:
-    for candidate in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]:
-        if os.path.isfile(candidate):
-            return candidate
-    return shutil.which("brew")
-
-
-def _ensure_homebrew() -> bool:
-    if _brew_path():
-        return True
-    print("\n  Homebrew not found — installing...")
-    result = subprocess.run(
-        ["bash", "-c", f'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL {HOMEBREW_INSTALL_URL})"'],
-        capture_output=False,
-    )
-    return result.returncode == 0
-
-
-def _install_packages(missing: list) -> bool:
-    if not shutil.which("pip3"):
-        brew = _brew_path()
-        if brew:
-            subprocess.run([brew, "install", "python3"], capture_output=False)
-    # --break-system-packages is only available on Python 3.11+
-    cmd = [sys.executable, "-m", "pip", "install", "-q"] + missing
-    if sys.version_info >= (3, 11):
-        cmd.insert(4, "--break-system-packages")
-    result = subprocess.run(cmd, capture_output=False)
-    return result.returncode == 0
-
-
-def bootstrap_dependencies():
-    """Check for missing packages and offer a single yes/no install prompt."""
-    missing = []
-    for pkg in REQUIRED_PACKAGES:
-        try:
-            __import__(pkg)
-        except ImportError:
-            missing.append(pkg)
-
-    if not missing:
-        return
-
-    names = " and ".join(f'"{p}"' for p in missing)
-    print(f"\n  Missing dependencies: {names}")
-    answer = input("  Install now? [Y/n] ").strip().lower()
-
-    if answer in ("", "y", "yes"):
-        if not _ensure_homebrew():
-            print("\n  [ERROR] Homebrew installation failed. Install manually:")
-            print(f"  pip3 install {' '.join(missing)}")
-            sys.exit(1)
-
-        print(f"  Installing {', '.join(missing)} ...")
-        if not _install_packages(missing):
-            print("\n  [ERROR] Package installation failed. Install manually:")
-            print(f"  pip3 install {' '.join(missing)}")
-            sys.exit(1)
-
-        import importlib
-        for pkg in missing:
-            try:
-                importlib.import_module(pkg)
-            except ImportError:
-                print(f"\n  [ERROR] Could not import '{pkg}' after install. Try rerunning.")
-                sys.exit(1)
-
-        print("  Dependencies installed.\n")
-    else:
-        print("\n  Cannot continue without dependencies. Exiting.")
-        sys.exit(0)
-
-
-bootstrap_dependencies()
-
-# ---------------------------------------------------------------------------
-# Third-party imports (safe after dep check)
-# ---------------------------------------------------------------------------
 
 import boto3
 import botocore.exceptions
@@ -128,22 +142,22 @@ from rich import box
 # Constants
 # ---------------------------------------------------------------------------
 
-TOOL_VERSION          = "1.1.0"
+TOOL_VERSION          = "1.2.0"
 REQUIRED_BINARIES     = ["hdiutil", "diskutil", "du", "df", "rsync"]
-MULTIPART_THRESHOLD_MB = 100      # Use multipart above this size
-CHUNK_SIZE_MB          = 50       # Each chunk for multipart upload
-VOLUME_OVERHEAD_FACTOR = 1.20     # 20 % extra headroom for staging volume
+MULTIPART_THRESHOLD_MB = 100
+CHUNK_SIZE_MB          = 50
+VOLUME_OVERHEAD_FACTOR = 1.20
 LOG_DIR                = Path("/var/log/mac_backup")
 
 # ---------------------------------------------------------------------------
-# AWS S3 configuration — set these before deploying
+# AWS S3 configuration
 # ---------------------------------------------------------------------------
 AWS_REGION  = "eu-west-1"
 AWS_BUCKET  = "dlocal-eu1-security-live-notebook-backups"
-AWS_PREFIX  = "macOS"   # base folder inside the bucket
+AWS_PREFIX  = "macOS"
 
 # ---------------------------------------------------------------------------
-# Theme — light-terminal compatible palette
+# Theme
 # ---------------------------------------------------------------------------
 
 THEME = {
@@ -157,13 +171,11 @@ THEME = {
 }
 
 console = Console(highlight=False)
-
-# Data volume path — needed by multiple functions
 DATA_VOLUME_PATH = Path("/System/Volumes/Data")
 
 
 # ---------------------------------------------------------------------------
-# Logging — file only, no Rich output on screen
+# Logging
 # ---------------------------------------------------------------------------
 
 def setup_logging(log_path: Path) -> tuple:
@@ -171,13 +183,9 @@ def setup_logging(log_path: Path) -> tuple:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file  = log_path / f"backup_{timestamp}.log"
 
-    # Get the named logger and configure it directly
-    # (avoids basicConfig being ignored if root logger was already initialized)
     log = logging.getLogger("mac_backup")
     log.setLevel(logging.DEBUG)
     log.propagate = False
-
-    # Remove any existing handlers (e.g. from a previous run in same process)
     log.handlers.clear()
 
     handler = logging.FileHandler(log_file)
@@ -247,7 +255,6 @@ def run_cmd(cmd: list, capture: bool = True, log: logging.Logger = None) -> subp
 
 
 def get_serial(log: logging.Logger = None) -> str:
-    """Return the hardware serial number via ioreg."""
     result = run_cmd(["ioreg", "-l", "-d", "2", "-c", "IOPlatformExpertDevice"], log=log)
     for line in result.stdout.splitlines():
         if "IOPlatformSerialNumber" in line:
@@ -266,7 +273,6 @@ def get_serial(log: logging.Logger = None) -> str:
 # ---------------------------------------------------------------------------
 
 def prompt_user_email(log: logging.Logger) -> str:
-    """Ask for the email of the user being backed up. Used as part of the S3 folder name."""
     print_step(0, "User Information")
     console.print("[dim]Enter the email address of the user being offboarded.[/]\n")
 
@@ -316,20 +322,17 @@ def select_backup_mode(log: logging.Logger) -> str:
 # ---------------------------------------------------------------------------
 
 def _get_data_volume_disk(log: logging.Logger) -> str:
-    """Return the disk identifier for /System/Volumes/Data (e.g. disk3s5)."""
     result = run_cmd(["df", str(DATA_VOLUME_PATH)], log=log)
     for line in result.stdout.splitlines()[1:]:
         parts = line.split()
         if parts:
-            # /dev/disk3s5 → disk3s5
             return parts[0].replace("/dev/", "")
-    return "disk1s1"   # safe fallback
+    return "disk1s1"
 
 
 def detect_time_machine(log: logging.Logger) -> dict:
     result: dict = {"snapshots": [], "local_backups": []}
 
-    # Try diskutil apfs listSnapshots for sizes (more reliable than tmutil)
     disk_id     = _get_data_volume_disk(log)
     disk_result = run_cmd(["diskutil", "apfs", "listSnapshots", disk_id], log=log)
     if disk_result.returncode == 0:
@@ -346,7 +349,6 @@ def detect_time_machine(log: logging.Logger) -> dict:
         if current_snap:
             result["snapshots"].append((current_snap, current_size))
     else:
-        # Fallback: tmutil listlocalsnapshots
         snap_result = run_cmd(["tmutil", "listlocalsnapshots", "/"], log=log)
         if snap_result.returncode == 0:
             for line in snap_result.stdout.strip().splitlines():
@@ -354,10 +356,8 @@ def detect_time_machine(log: logging.Logger) -> dict:
                 if line:
                     result["snapshots"].append((line, "unknown"))
 
-    # Local backup destinations — parse each destination block independently
     dest_result = run_cmd(["tmutil", "destinationinfo"], log=log)
     if dest_result.returncode == 0 and "Kind" in dest_result.stdout:
-        # Split output into per-destination blocks separated by blank lines
         blocks = dest_result.stdout.strip().split("\n\n")
         for block in blocks:
             b_name, b_path = None, None
@@ -460,13 +460,16 @@ def validate_dependencies(log: logging.Logger) -> bool:
             log.error(f"Missing binary: {binary}")
             all_ok = False
 
-    for pkg in REQUIRED_PACKAGES:
+    for pkg in _REQUIRED:
         try:
-            __import__(pkg)
+            importlib.import_module(pkg)
             table.add_row(f"python:{pkg}", "[green]✓  installed[/]")
         except ImportError:
             table.add_row(f"python:{pkg}", "[red]✗  missing[/]")
             all_ok = False
+
+    # Show where deps were loaded from
+    table.add_row("deps location", f"[dim]{DEPS_DIR}[/]")
 
     console.print(table)
 
@@ -552,10 +555,9 @@ def select_user(log: logging.Logger) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Exclude lists — single source of truth for size calc + rsync
+# Exclude lists
 # ---------------------------------------------------------------------------
 
-# Always excluded — Library has TCC-protected subfolders that break rsync.
 RSYNC_EXCLUDES_BASE = [
     "Library",
     ".DS_Store",
@@ -565,16 +567,13 @@ RSYNC_EXCLUDES_BASE = [
     ".TemporaryItems",
 ]
 
-# Known virtualization patterns grouped by product.
 VM_PATTERNS: list = [
-    # Traditional VMs
     ("Parallels",            ["Parallels", "*.macvm", "*.pvm"]),
     ("VMware Fusion",        ["Virtual Machines", "*.vmwarevm", "*.vmx", "*.vmdk"]),
     ("VirtualBox",           ["VirtualBox VMs", "*.vbox", "*.vdi"]),
     ("UTM",                  ["UTM", "*.utm"]),
     ("QEMU",                 ["*.qcow2", "*.qcow", "*.img"]),
     ("Vagrant",              [".vagrant.d"]),
-    # Container runtimes
     ("Docker Desktop",       [".docker"]),
     ("Podman",               [".local/share/containers", ".config/containers"]),
     ("Lima",                 [".lima"]),
@@ -582,7 +581,6 @@ VM_PATTERNS: list = [
     ("Rancher Desktop",      [".rd", ".local/share/rancher-desktop"]),
     ("Podman Desktop",       [".local/share/containers/podman"]),
     ("nerdctl / containerd", [".local/share/nerdctl", ".local/share/containerd"]),
-    # Kubernetes
     ("kubectl / kubeconfig", [".kube"]),
     ("k3d",                  [".k3d"]),
     ("kind",                 [".kind"]),
@@ -613,9 +611,6 @@ def detect_vm_folders(user: str, log: logging.Logger) -> list:
         matched = []
         for name, entry in entries.items():
             for pat in patterns:
-                # For patterns with slashes (e.g. ".local/share/containers"),
-                # only match against the top-level component (.local) so we
-                # detect it correctly — deep path matching is done by rsync.
                 top_level_pat = pat.split("/")[0]
                 if fnmatch.fnmatch(name, top_level_pat):
                     matched.append(entry)
@@ -641,25 +636,16 @@ def detect_vm_folders(user: str, log: logging.Logger) -> list:
 
 
 def _multiselect(title: str, items: list) -> list:
-    """Interactive multi-select using curses.
-    Arrow keys to move, Space to toggle inclusion, Enter to confirm.
-    Returns list of selected indices (0-based).
-    Default: nothing selected (all excluded).
-    """
     import curses
 
-    selected = set()   # indices the technician wants to INCLUDE
+    selected = set()
 
     def _draw(stdscr, cursor):
         stdscr.clear()
         h, w = stdscr.getmaxyx()
-
-        # Header
         stdscr.addstr(0, 0, title[:w-1], curses.A_BOLD)
         stdscr.addstr(1, 0, "─" * min(w-1, 60))
         stdscr.addstr(2, 0, "↑↓ move   Space = include   Enter = confirm   A = include all   N = include none")
-
-        # Items
         for i, (name, size) in enumerate(items):
             row = 4 + i
             if row >= h - 1:
@@ -668,18 +654,15 @@ def _multiselect(title: str, items: list) -> list:
             line    = f"  {marker}  {name:<22} {size}"
             style   = curses.A_REVERSE if i == cursor else curses.A_NORMAL
             stdscr.addstr(row, 0, line[:w-1], style)
-
         stdscr.refresh()
 
     def _run(stdscr):
         curses.curs_set(0)
         cursor = 0
         n      = len(items)
-
         while True:
             _draw(stdscr, cursor)
             key = stdscr.getch()
-
             if key in (curses.KEY_UP, ord("k")) and cursor > 0:
                 cursor -= 1
             elif key in (curses.KEY_DOWN, ord("j")) and cursor < n - 1:
@@ -693,23 +676,17 @@ def _multiselect(title: str, items: list) -> list:
                 selected.update(range(n))
             elif key in (ord("n"), ord("N")):
                 selected.clear()
-            elif key in (10, 13, curses.KEY_ENTER):   # Enter
+            elif key in (10, 13, curses.KEY_ENTER):
                 break
-
         return list(selected)
 
     try:
         return curses.wrapper(_run)
     except Exception:
-        # Fallback if curses fails (e.g. non-interactive terminal)
         return []
 
 
 def select_vm_folders(user: str, detected: list, log: logging.Logger) -> list:
-    """Let the technician choose which VM/container folders to INCLUDE.
-    Default: all excluded. Space to mark for inclusion, Enter to confirm.
-    Returns a list of glob patterns to ADD to the exclude list (i.e. not included).
-    """
     console.print()
     console.rule("[bold]Virtualization / Container Data Detected[/]", style=THEME["rule"], characters="─")
     console.print()
@@ -749,12 +726,6 @@ def select_vm_folders(user: str, detected: list, log: logging.Logger) -> list:
 # ---------------------------------------------------------------------------
 
 def get_free_space(path: Path = None, log: logging.Logger = None) -> int:
-    """Return free bytes on the APFS data volume (or on a given path).
-
-    On macOS with APFS, user data lives on /System/Volumes/Data which shares
-    the same pool as /, but statvfs('/') returns a smaller free value than
-    the actual available space. Always measure Data unless a path is given.
-    """
     if path is None:
         data_vol = Path("/System/Volumes/Data")
         target   = data_vol if data_vol.exists() else Path("/")
@@ -769,9 +740,6 @@ def get_free_space(path: Path = None, log: logging.Logger = None) -> int:
 
 
 def get_folder_size(path: Path, log: logging.Logger, excludes: Optional[list] = None) -> int:
-    """Return folder size in bytes, skipping excluded top-level entries.
-    Uses the same exclude list as rsync so size calc and copy always match.
-    """
     import fnmatch
     active_excludes = excludes if excludes is not None else RSYNC_EXCLUDES_BASE
     log.info(f"Calculating size of {path} (excludes applied)…")
@@ -810,20 +778,17 @@ def get_folder_size(path: Path, log: logging.Logger, excludes: Optional[list] = 
 
 
 def prompt_for_external_drive(needed_bytes: int, log: logging.Logger) -> Optional[Path]:
-    """Ask for an external drive path and validate it has enough free space."""
     console.print()
     console.print(Panel(
         f"[bold #BA7517]Insufficient space on the internal disk.[/]\n\n"
-        f"Insert an external drive (USB, pendrive, or portable disk) with at least "
+        f"Insert an external drive with at least "
         f"[bold cyan]{bytes_to_human(needed_bytes)}[/] of free space.\n\n"
-        f"External drives are usually mounted under [#0F6E56]/Volumes/[/].\n"
-        f"Example: [dim]/Volumes/MyDrive[/]",
+        f"External drives are usually mounted under [#0F6E56]/Volumes/[/].",
         title="[bold #BA7517]⚠  External Drive Required[/]",
         border_style="#FAC775",
     ))
     console.print()
 
-    # Show mounted /Volumes as a hint
     result = run_cmd(["df", "-H", "-l"], log=log)
     hints  = []
     for line in result.stdout.splitlines()[1:]:
@@ -840,8 +805,6 @@ def prompt_for_external_drive(needed_bytes: int, log: logging.Logger) -> Optiona
             ht.add_row(mount, avail)
         console.print(ht)
         console.print()
-    else:
-        console.print("[dim]No external volumes detected yet — insert the drive first.[/]\n")
 
     for _ in range(3):
         raw = Prompt.ask(
@@ -849,17 +812,15 @@ def prompt_for_external_drive(needed_bytes: int, log: logging.Logger) -> Optiona
         ).strip()
 
         if raw.lower() in ("q", "quit", "exit"):
-            log.info("Technician quit at external drive prompt.")
             return None
 
         drive_path = Path(raw)
-
         if not drive_path.exists() or not drive_path.is_dir():
             print_warning(f"Path not found or not a directory: {drive_path}")
-            log.warning(f"Invalid external drive path: {drive_path}")
             continue
 
         drive_free = get_free_space(drive_path, log=log)
+        size_match = drive_free >= needed_bytes
 
         st = Table(box=box.SIMPLE, show_header=False)
         st.add_column("Label", style="dim",  width=28)
@@ -868,31 +829,22 @@ def prompt_for_external_drive(needed_bytes: int, log: logging.Logger) -> Optiona
         st.add_row("Free on drive", bytes_to_human(drive_free))
         st.add_row("Required",      bytes_to_human(needed_bytes))
         st.add_row("Space check",
-                   "[green]✓ Sufficient[/]" if drive_free >= needed_bytes
-                   else "[red]✗ Insufficient[/]")
+                   "[green]✓ Sufficient[/]" if size_match else "[red]✗ Insufficient[/]")
         console.print(st)
-        console.print()
 
-        if drive_free >= needed_bytes:
-            log.info(f"External drive OK: {drive_path} (free: {bytes_to_human(drive_free)})")
+        if size_match:
+            log.info(f"External drive OK: {drive_path}")
             print_success(f"Using external drive: {drive_path}")
             return drive_path
 
         shortage = needed_bytes - drive_free
-        print_warning(
-            f"This drive is {bytes_to_human(shortage)} short. "
-            f"Try a drive with at least {bytes_to_human(needed_bytes)} free."
-        )
-        log.warning(f"Drive too small: {drive_path} — "
-                    f"free={bytes_to_human(drive_free)}, needed={bytes_to_human(needed_bytes)}")
+        print_warning(f"Drive is {bytes_to_human(shortage)} short.")
 
-    print_error("No valid external drive provided after 3 attempts. Aborting.")
-    log.error("External drive selection failed after 3 attempts.")
+    print_error("No valid external drive provided. Aborting.")
     return None
 
 
 def check_disk_space(user: str, log: logging.Logger, excludes: list) -> tuple:
-    """Returns (folder_bytes, needed_bytes, staging_dir | None)."""
     print_step(3, "Disk Space Analysis")
 
     home = Path(f"/Users/{user}")
@@ -914,15 +866,12 @@ def check_disk_space(user: str, log: logging.Logger, excludes: list) -> tuple:
     console.print(table)
 
     if free_bytes >= needed_bytes:
-        log.info(f"Space OK — needed: {bytes_to_human(needed_bytes)}, "
-                 f"free: {bytes_to_human(free_bytes)}")
+        log.info(f"Space OK — needed: {bytes_to_human(needed_bytes)}, free: {bytes_to_human(free_bytes)}")
         print_success("Internal disk has sufficient space.")
         staging_dir = Path(tempfile.gettempdir())
-        log.info(f"Staging dir: {staging_dir}")
         return folder_bytes, needed_bytes, staging_dir
 
-    log.warning(f"Insufficient space — needed: {bytes_to_human(needed_bytes)}, "
-                f"free: {bytes_to_human(free_bytes)}")
+    log.warning(f"Insufficient space — needed: {bytes_to_human(needed_bytes)}, free: {bytes_to_human(free_bytes)}")
     print_error("Not enough free space on the internal disk.")
     staging_dir = prompt_for_external_drive(needed_bytes, log)
     return folder_bytes, needed_bytes, staging_dir
@@ -947,7 +896,7 @@ def create_sparse_volume(needed_bytes: int, staging_dir: Path, log: logging.Logg
         "-type",    "SPARSE",
         "-fs",      "APFS",
         "-volname", "BackupStaging",
-        str(volume_path.with_suffix("")),   # hdiutil appends .sparseimage
+        str(volume_path.with_suffix("")),
     ]
 
     with console.status(f"[#0F6E56]Creating {size_mb} MB sparse image…[/]", spinner="dots", spinner_style="#1D9E75"):
@@ -955,12 +904,10 @@ def create_sparse_volume(needed_bytes: int, staging_dir: Path, log: logging.Logg
 
     if result.returncode != 0:
         print_error(f"hdiutil create failed: {result.stderr.strip()}")
-        log.error(f"hdiutil create: {result.stderr.strip()}")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
     print_success(f"Sparse volume created ({bytes_to_human(needed_bytes)})")
-    log.info(f"Sparse image at {volume_path}")
     return volume_path
 
 
@@ -971,7 +918,6 @@ def mount_sparse_volume(volume_path: Path, log: logging.Logger) -> Optional[Path
 
     if result.returncode != 0:
         print_error(f"hdiutil attach failed: {result.stderr.strip()}")
-        log.error(f"hdiutil attach: {result.stderr.strip()}")
         return None
 
     mount_point = None
@@ -983,7 +929,6 @@ def mount_sparse_volume(volume_path: Path, log: logging.Logger) -> Optional[Path
 
     if not mount_point:
         print_error("Could not determine mount point.")
-        log.error(f"hdiutil attach output:\n{result.stdout}")
         return None
 
     log.info(f"Staging mounted at {mount_point}")
@@ -1008,7 +953,6 @@ RSYNC_ACCEPTABLE = {0, 23, 24}
 
 
 def _run_rsync(cmd: list, label: str, log: logging.Logger) -> int:
-    """Run rsync with a progress spinner. Returns the exit code."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     with Progress(
@@ -1029,7 +973,6 @@ def _run_rsync(cmd: list, label: str, log: logging.Logger) -> int:
     if rc not in RSYNC_ACCEPTABLE:
         if rc == 11 or "short write" in stderr or "out of space" in stderr.lower():
             print_error("rsync failed: staging volume ran out of space.")
-            print_warning("Free up disk space and try again.")
         else:
             print_error(f"rsync failed (code {rc}) — see log for details.")
         log.error(f"rsync failed (code {rc}): {stderr.strip()}")
@@ -1054,7 +997,6 @@ def copy_user_home(user: str, mount_point: Path, log: logging.Logger, excludes: 
     cmd = ["rsync", "-aH", "--ignore-errors"] + exclude_args + [f"{src}/", f"{dst}/"]
 
     rc = _run_rsync(cmd, "Copying files…", log)
-
     if rc not in RSYNC_ACCEPTABLE:
         return False
 
@@ -1068,16 +1010,13 @@ def copy_user_home(user: str, mount_point: Path, log: logging.Logger, excludes: 
 # ---------------------------------------------------------------------------
 
 def _hdiutil_create_dmg(src_folder: Path, dmg_out: Path, log: logging.Logger) -> Optional[Path]:
-    """Create a compressed read-only DMG (no encryption — S3 SSE-KMS handles it).
-    Returns the final .dmg path or None on failure.
-    """
     dmg_name = dmg_out.stem
     cmd = [
         "hdiutil", "create",
         "-srcfolder", str(src_folder),
         "-volname",   dmg_name,
         "-format",    "UDZO",
-        str(dmg_out.with_suffix("")),   # hdiutil adds .dmg itself
+        str(dmg_out.with_suffix("")),
     ]
 
     with console.status("[#0F6E56]Creating compressed DMG…[/] [dim](this may take a while)[/]",
@@ -1099,7 +1038,6 @@ def _hdiutil_create_dmg(src_folder: Path, dmg_out: Path, log: logging.Logger) ->
 
 
 def create_dmg(user: str, mount_point: Path, output_dir: Path, log: logging.Logger) -> Optional[Path]:
-    """Create a compressed DMG from the staged user home. Encryption is handled by S3 SSE-KMS."""
     print_step(5, "Creating DMG")
 
     serial    = get_serial(log)
@@ -1110,7 +1048,6 @@ def create_dmg(user: str, mount_point: Path, output_dir: Path, log: logging.Logg
 
     if not src.exists():
         print_error(f"Source folder not found in staging: {src}")
-        log.error(f"DMG source missing: {src}")
         return None
 
     log.info(f"Creating DMG: {dmg_out}")
@@ -1128,13 +1065,12 @@ def create_dmg(user: str, mount_point: Path, output_dir: Path, log: logging.Logg
 
 
 # ---------------------------------------------------------------------------
-# Full volume backup (Macintosh HD - Data)
+# Full volume backup
 # ---------------------------------------------------------------------------
 
 VOLUME_EXCLUDES = [
     ".Spotlight-V100", ".fseventsd", ".TemporaryItems", ".DS_Store", "*.sock",
     "private/tmp", "private/var/folders",
-    # TCC-protected — inaccessible even with sudo
     "private/var/networkd", "private/var/OOPJit",
     "Library/Caches/com.apple.aneuserd", "Library/Caches/com.apple.aned",
     "System/Library/AssetsV2",
@@ -1149,7 +1085,6 @@ def backup_full_volume(staging_dir: Path, log: logging.Logger) -> Optional[Path]
     src = DATA_VOLUME_PATH
     log.info(f"Full volume backup: {src}")
 
-    # Measure used space
     with console.status("[#0F6E56]Calculating volume size…[/]", spinner="dots", spinner_style="#1D9E75"):
         df_result = run_cmd(["df", "-k", str(src)], log=log)
         used_kb = 0
@@ -1196,12 +1131,10 @@ def backup_full_volume(staging_dir: Path, log: logging.Logger) -> Optional[Path]
     dst.mkdir(parents=True, exist_ok=True)
 
     console.print("[dim]Copying Macintosh HD - Data to staging volume…[/]\n")
-    log.info(f"rsync {src} → {dst}")
 
     exclude_args = [arg for e in VOLUME_EXCLUDES for arg in ("--exclude", e)]
     cmd = ["rsync", "-aH", "--ignore-errors"] + exclude_args + [f"{src}/", f"{dst}/"]
 
-    # Code 1 is acceptable for a live system volume — some paths are TCC-protected
     ACCEPTABLE_VOLUME = {0, 1, 23, 24}
     PERMISSION_MARKERS = ("Operation not permitted", "could not stat", "unreadable directory")
 
@@ -1235,15 +1168,11 @@ def backup_full_volume(staging_dir: Path, log: logging.Logger) -> Optional[Path]
     )
     if only_perms:
         print_warning("Some system-protected paths were skipped (TCC) — this is expected.")
-        log.warning("Volume rsync code 1 — only permission errors, treated as OK.")
     elif rc in (1, 23, 24):
         print_warning("Copy finished with warnings — some files skipped (see log).")
-        log.warning(f"Volume rsync code {rc}: {stderr.strip()[:300]}")
     else:
         print_success("Volume copied to staging.")
-    log.info(f"Volume rsync complete (code {rc}).")
 
-    # Create DMG — no local encryption, S3 SSE-KMS handles it
     serial    = get_serial(log)
     datestamp = datetime.now().strftime("%Y%m%d")
     dmg_name  = f"{serial}_volume_{datestamp}"
@@ -1251,8 +1180,6 @@ def backup_full_volume(staging_dir: Path, log: logging.Logger) -> Optional[Path]
 
     console.print()
     dmg_path = _hdiutil_create_dmg(dst, dmg_out, log)
-
-    # Unmount staging after DMG creation
     unmount_volume(mount_point, log)
 
     if not dmg_path:
@@ -1261,7 +1188,6 @@ def backup_full_volume(staging_dir: Path, log: logging.Logger) -> Optional[Path]
 
     size = dmg_path.stat().st_size
     print_success(f"DMG created: [bold]{dmg_path.name}[/] ({bytes_to_human(size)})")
-    log.info(f"Volume DMG: {dmg_path} ({bytes_to_human(size)})")
     return dmg_path
 
 
@@ -1270,7 +1196,6 @@ def backup_full_volume(staging_dir: Path, log: logging.Logger) -> Optional[Path]
 # ---------------------------------------------------------------------------
 
 def get_aws_credentials(log: logging.Logger, s3_prefix: str) -> Optional[dict]:
-    """Ask only for AWS keys. Region and bucket are hardcoded constants."""
     print_step(6, "AWS S3 Credentials")
     console.print(f"[dim]Bucket:[/] [#0F6E56]{AWS_BUCKET}[/]  [dim]Region:[/] [#0F6E56]{AWS_REGION}[/]")
     console.print(f"[dim]Folder:[/] [#0F6E56]{s3_prefix}/[/]\n")
@@ -1318,8 +1243,7 @@ def upload_to_s3(dmg_path: Path, creds: dict, log: logging.Logger) -> bool:
     file_size     = dmg_path.stat().st_size
     chunk_bytes   = CHUNK_SIZE_MB * 1024 * 1024
     use_multipart = file_size > MULTIPART_THRESHOLD_MB * 1024 * 1024
-    key_prefix    = creds["prefix"]
-    s3_key        = f"{key_prefix}/{dmg_path.name}".lstrip("/")
+    s3_key        = f"{creds['prefix']}/{dmg_path.name}".lstrip("/")
 
     console.print()
     console.print(f"[dim]Destination:[/] [#0F6E56]s3://{creds['bucket']}/{s3_key}[/]")
@@ -1331,7 +1255,6 @@ def upload_to_s3(dmg_path: Path, creds: dict, log: logging.Logger) -> bool:
         local_sha256 = compute_sha256(dmg_path, log)
     print_success(f"Local SHA-256: {local_sha256}")
 
-    # Connect and verify bucket access
     try:
         session = boto3.Session(
             aws_access_key_id=creds["access_key"],
@@ -1350,7 +1273,6 @@ def upload_to_s3(dmg_path: Path, creds: dict, log: logging.Logger) -> bool:
         log.error(f"AWS connection: {e}")
         return False
 
-    # Upload
     try:
         with Progress(
             SpinnerColumn(), TextColumn("[#0F6E56]{task.description}"),
@@ -1359,8 +1281,6 @@ def upload_to_s3(dmg_path: Path, creds: dict, log: logging.Logger) -> bool:
         ) as progress:
             task    = progress.add_task("Uploading to S3…", total=file_size)
             tracker = S3UploadProgress(file_size, progress, task)
-
-            # SSE-KMS — encrypt at rest using the default aws/s3 KMS key
             extra_args = {"ServerSideEncryption": "aws:kms"}
 
             if use_multipart:
@@ -1384,17 +1304,14 @@ def upload_to_s3(dmg_path: Path, creds: dict, log: logging.Logger) -> bool:
         log.error(f"Upload error: {e}")
         return False
 
-    # ETag integrity check
     console.print()
     with console.status("[#0F6E56]Validating upload integrity…[/]", spinner="dots", spinner_style="#1D9E75"):
         try:
             head        = s3.head_object(Bucket=creds["bucket"], Key=s3_key)
             etag        = head["ETag"].strip('"')
             remote_size = head["ContentLength"]
-            log.info(f"S3 ETag: {etag} | Remote size: {remote_size}")
         except Exception as e:
             print_warning(f"Could not retrieve ETag: {e}")
-            log.warning(f"ETag retrieval: {e}")
             return True
 
     size_match = remote_size == file_size
@@ -1414,7 +1331,6 @@ def upload_to_s3(dmg_path: Path, creds: dict, log: logging.Logger) -> bool:
         log.warning(f"Size mismatch: local={file_size}, remote={remote_size}")
     else:
         print_success("Integrity check passed.")
-        log.info("Integrity check passed.")
 
     return True
 
@@ -1437,29 +1353,25 @@ def cleanup(
     table.add_column("Path", style="#0F6E56")
 
     if dmg_path      and dmg_path.exists():
-        table.add_row("DMG file",            str(dmg_path))
+        table.add_row("DMG file",             str(dmg_path))
     if sparse_volume and sparse_volume.exists():
         table.add_row("Sparse staging image", str(sparse_volume))
     if mount_point   and mount_point.exists():
-        table.add_row("Staging mount point", str(mount_point))
-    table.add_row("Log file", str(log_file))
+        table.add_row("Staging mount point",  str(mount_point))
+    table.add_row("Log file",     str(log_file))
+    table.add_row("Deps folder",  str(DEPS_DIR))
     console.print(table)
     console.print()
 
-    # Unmount staging volume if still mounted
     if mount_point and mount_point.exists():
         if Confirm.ask("[#0F6E56]Unmount staging volume?[/]", default=True):
             unmount_volume(mount_point, log)
 
-    # Remove temp files
-    # The DMG may live inside sparse_volume.parent (same tmp dir).
-    # Build a deduplicated list: prefer the parent dir over the individual file.
     items_to_remove = []
     tmp_dir = sparse_volume.parent if sparse_volume and sparse_volume.exists() else None
     if tmp_dir:
         items_to_remove.append(tmp_dir)
     if dmg_path and dmg_path.exists():
-        # Only add DMG separately if it lives outside the tmp dir
         if tmp_dir is None or not str(dmg_path).startswith(str(tmp_dir)):
             items_to_remove.append(dmg_path)
 
@@ -1476,10 +1388,8 @@ def cleanup(
                     print_success(f"Removed: {item}")
                 except Exception as e:
                     print_warning(f"Could not remove {item}: {e}")
-                    log.warning(f"Remove failed {item}: {e}")
         else:
             print_warning("Temporary files kept — clean up manually when done.")
-            log.info("Temporary files kept by user choice.")
 
     console.print()
     console.print(Panel.fit(
@@ -1497,7 +1407,6 @@ def cleanup(
 def main():
     print_header()
 
-    # Setup logging — fallback to /tmp if /var/log is not writable
     try:
         log, log_file = setup_logging(LOG_DIR)
     except PermissionError:
@@ -1507,35 +1416,28 @@ def main():
 
     log.info(f"=== mac_backup.py v{TOOL_VERSION} started ===")
     log.info(f"Running as: {getpass.getuser()} | macOS {platform.mac_ver()[0]}")
+    log.info(f"DEPS_DIR: {DEPS_DIR}")
 
     sparse_volume: Optional[Path] = None
     mount_point:   Optional[Path] = None
     dmg_path:      Optional[Path] = None
 
     try:
-        # Dependencies
         if not validate_dependencies(log):
             sys.exit(1)
 
-        # Collect user email upfront — used for S3 folder naming
         user_email = prompt_user_email(log)
+        mode       = select_backup_mode(log)
 
-        # Backup mode
-        mode = select_backup_mode(log)
-
-        # Time Machine check (both modes)
         if not handle_time_machine(log):
             sys.exit(1)
 
-        # ── User backup ──────────────────────────────────────────────────
         if mode == BACKUP_MODE_USER:
-
             user = select_user(log)
             if not user:
                 print_error("No user selected. Exiting.")
                 sys.exit(1)
 
-            # Detect VM / container folders
             with console.status("[#0F6E56]Scanning for virtualization and container data…[/]",
                                 spinner="dots", spinner_style="#1D9E75"):
                 detected_vms = detect_vm_folders(user, log)
@@ -1545,18 +1447,15 @@ def main():
                 vm_excludes = select_vm_folders(user, detected_vms, log)
             else:
                 console.print("[dim]No virtualization or container folders detected.[/]\n")
-                log.info("No VM/container folders detected.")
 
             active_excludes = build_excludes(vm_excludes)
 
-            # Disk space check
             folder_bytes, needed_bytes, staging_dir = check_disk_space(
                 user, log, excludes=active_excludes
             )
             if staging_dir is None:
                 sys.exit(1)
 
-            # Create staging volume and copy
             sparse_volume = create_sparse_volume(needed_bytes, staging_dir, log)
             if not sparse_volume:
                 sys.exit(1)
@@ -1569,51 +1468,42 @@ def main():
                 sys.exit(1)
 
             dmg_path = create_dmg(user, mount_point, staging_dir, log)
-
-            # Unmount staging after DMG creation
             unmount_volume(mount_point, log)
-            mount_point = None   # prevent double-unmount in cleanup
+            mount_point = None
 
             if not dmg_path:
                 sys.exit(1)
 
-        # ── Full volume backup ───────────────────────────────────────────
         else:
             staging_dir = Path(tempfile.gettempdir())
             dmg_path    = backup_full_volume(staging_dir, log)
             if not dmg_path:
                 sys.exit(1)
 
-        # S3 upload (both modes) — retry on credential or upload error
-        serial     = get_serial(log)
-        s3_prefix  = f"{AWS_PREFIX}/{serial}_{user_email}"
+        serial    = get_serial(log)
+        s3_prefix = f"{AWS_PREFIX}/{serial}_{user_email}"
         log.info(f"S3 folder: {s3_prefix}")
 
         while True:
             creds = get_aws_credentials(log, s3_prefix)
             if not creds:
-                # Technician left a required field blank
                 if not Confirm.ask("[#0F6E56]Try entering credentials again?[/]", default=True):
                     print_warning("Upload skipped — DMG preserved locally.")
-                    log.warning("S3 upload skipped by technician.")
                     break
                 continue
 
             if upload_to_s3(dmg_path, creds, log):
-                break   # success
+                break
 
-            # Upload failed — ask if they want to retry with different credentials
             console.print()
             if Confirm.ask("[#0F6E56]Retry with different credentials?[/]", default=True):
                 continue
             print_warning("Upload failed — DMG preserved locally.")
-            log.error("S3 upload failed and technician chose not to retry.")
             break
 
     except KeyboardInterrupt:
         console.print()
         print_warning("Interrupted by user.")
-        log.warning("Interrupted by user (KeyboardInterrupt).")
 
     finally:
         cleanup(sparse_volume, mount_point, dmg_path, log, log_file)
